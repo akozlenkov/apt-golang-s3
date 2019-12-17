@@ -1,20 +1,3 @@
-// Copyright 2018 Google LLC
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
-// Package method implements functions to satisfy the method interface of the APT
-// software package manager. For more information about the APT method interface
-// see, http://www.fifi.org/doc/libapt-pkg-doc/method.html/ch2.html#s2.3.
 package method
 
 import (
@@ -26,6 +9,15 @@ import (
 	"crypto/sha512"
 	"errors"
 	"fmt"
+	"github.com/akozlenkov/apt-golang-s3/message"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"hash"
 	"io"
 	"io/ioutil"
@@ -36,17 +28,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-
-	"github.com/google/apt-golang-s3/message"
 )
 
 const (
@@ -95,18 +76,19 @@ const (
 	fieldValueTrue       = "true"
 	fieldValueYes        = "yes"
 	fieldValueNotFound   = "The specified key does not exist."
-	fieldValueConnecting = "Connecting to s3.amazonaws.com"
+	fieldValueConnecting = "Connecting to %s"
 )
 
 const (
-	configItemAcquireS3Region = "Acquire::s3::region"
-	s3Hostname = "s3.amazonaws.com"
+	configItemAcquireS3Region   = "Acquire::s3::region"
+	configItemAcquireS3Insecure = "Acquire::s3::insecure"
 )
 
 // A Method implements the logic to process incoming apt messages and respond
 // accordingly.
 type Method struct {
 	region     string
+	insecure   bool
 	msgChan    chan []byte
 	configured bool
 	wg         *sync.WaitGroup
@@ -231,37 +213,22 @@ func newLocation(value string) (objectLocation, error) {
 	if err != nil {
 		return objectLocation{}, nil
 	}
-	if uri.Host == s3Hostname {
-		tokens := strings.Split(uri.Path, "/")
 
-		// splitting "/bucket/this/is/a/path" on "/" produces
-		// ["", "bucket", "this", "is", "a", "path"]
-		// Note the initial empty string
-		if len(tokens) < 3 {
-			return objectLocation{}, errors.New("location missing required number of tokens")
-		}
+	tokens := strings.Split(uri.Path, "/")
 
-		// the first non-zero length string is assumed to be the bucket. the rest are
-		// concatenated back together as the path to the object in the bucket
-		return objectLocation{
-			uri:    uri,
-			bucket: tokens[1],
-			key:    strings.Join(tokens[2:], "/"),
-		}, nil
+	// splitting "/bucket/this/is/a/path" on "/" produces
+	// ["", "bucket", "this", "is", "a", "path"]
+	// Note the initial empty string
+	if len(tokens) < 3 {
+		return objectLocation{}, errors.New("location missing required number of tokens")
 	}
 
-	if strings.HasSuffix(uri.Host, s3Hostname) {
-		return objectLocation{
-			uri:    uri,
-			bucket: strings.TrimSuffix(uri.Host, "."+s3Hostname),
-			key:    uri.Path[1:],
-		}, nil
-	}
-
-	return  objectLocation{
+	// the first non-zero length string is assumed to be the bucket. the rest are
+	// concatenated back together as the path to the object in the bucket
+	return objectLocation{
 		uri:    uri,
-		bucket: uri.Host,
-		key:    uri.Path[1:],
+		bucket: tokens[1],
+		key:    strings.Join(tokens[2:], "/"),
 	}, nil
 }
 
@@ -276,9 +243,9 @@ func (m *Method) uriAcquire(msg *message.Message) {
 	ol, err := newLocation(uri)
 	m.handleError(err)
 
-	m.outputRequestStatus(ol.uri, fieldValueConnecting)
+	m.outputRequestStatus(ol.uri, fmt.Sprintf(fieldValueConnecting, ol.uri.Host))
 
-	client := m.s3Client(ol.uri.User)
+	client := m.s3Client(ol.uri)
 
 	headObjectInput := &s3.HeadObjectInput{Bucket: &ol.bucket, Key: &ol.key}
 	headObjectOutput, err := client.HeadObject(headObjectInput)
@@ -322,11 +289,15 @@ func (m *Method) uriAcquire(msg *message.Message) {
 // s3Client provides an initialized s3iface.S3API based on the contents of the
 // provided url.URL. The access key id and secret access key are assumed to
 // correspond to the Username() and Password() functions on the URL's User.
-func (m *Method) s3Client(user *url.Userinfo) s3iface.S3API {
+func (m *Method) s3Client(url *url.URL) s3iface.S3API {
+	user := url.User
 	awsAccessKeyID := user.Username()
 	awsSecretAccessKey, hasPass := user.Password()
-	config := &aws.Config{
-		Region: aws.String(m.region),
+	config := aws.Config{
+		DisableSSL:       aws.Bool(m.insecure),
+		S3ForcePathStyle: aws.Bool(true),
+		Region:           aws.String(m.region),
+		Endpoint:         aws.String(url.Host),
 	}
 	if awsAccessKeyID != "" {
 		if !hasPass {
@@ -334,8 +305,10 @@ func (m *Method) s3Client(user *url.Userinfo) s3iface.S3API {
 		}
 		config.Credentials = credentials.NewStaticCredentials(awsAccessKeyID, awsSecretAccessKey, "")
 	}
-	sess := session.Must(session.NewSession())
-	return s3.New(sess, config)
+	sess := session.Must(session.NewSessionWithOptions(session.Options{
+		Config: config,
+	}))
+	return s3.New(sess)
 }
 
 // configure loops though the Config-Item fields of a configuration Message and
@@ -348,6 +321,13 @@ func (m *Method) configure(msg *message.Message) {
 		config := strings.Split(f.Value, "=")
 		if config[0] == configItemAcquireS3Region {
 			m.region = config[1]
+		}
+		if config[0] == configItemAcquireS3Insecure {
+			b, err := strconv.ParseBool(config[1])
+			if err != nil {
+				m.insecure = false
+			}
+			m.insecure = b
 		}
 	}
 	m.configured = true

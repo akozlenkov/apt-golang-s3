@@ -23,7 +23,7 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/google/apt-golang-s3/method"
+	"github.com/akozlenkov/apt-golang-s3/method"
 )
 
 const (
