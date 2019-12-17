@@ -90,7 +90,7 @@ list configuration as follows:
 
 ```
 $ cat /etc/apt/sources.list.d/my-private-repo.list
-deb s3://aws-access-key-id:aws-secret-access-key@s3.amazonaws.com/my-private-repo-bucket stable main
+deb s3://aws-access-key-id:aws-secret-access-key@s3.example.com/my-private-repo-bucket stable main
 ```
 
 ### APT Method Configuration
@@ -99,7 +99,11 @@ The current default AWS region is set to `us-east-1`, but can be overridden by
 adding an option in your apt configuration, e.g.
 
 ```
-echo "Acquire::s3::region us-east-1;" > /etc/apt/apt.conf.d/s3
+echo "Acquire::s3::region us-east-1;" >> /etc/apt/apt.conf.d/s3
+```
+Allow insecure connection for self hosted s3 instances.
+```
+echo "Acquire::s3::insecure true;" >> /etc/apt/apt.conf.d/s3
 ```
 
 Additional configuration options may be added in the future.
